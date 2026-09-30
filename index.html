@@ -1,0 +1,436 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>groundtruth</title>
+<style>
+:root{--bg:#090b09;--ink:#eef2ea;--mut:#98a294;--dim:#586055;--a1:#a8cc70;--a2:#86a8c4;
+ --gold:#e3c765;--line:rgba(238,242,234,.09);--mono:ui-monospace,SFMono-Regular,Menlo,monospace}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 ui-sans-serif,system-ui,sans-serif;overflow:hidden}
+#c{position:fixed;inset:0;display:block}
+#top{position:fixed;top:0;left:0;right:0;z-index:10;padding:15px 20px;display:flex;gap:11px;
+ align-items:center;background:linear-gradient(180deg,rgba(9,11,9,.9),transparent 90%);pointer-events:none}
+#top h1{margin:0;font-size:15px;font-weight:600;letter-spacing:-.02em}
+.pill{font-family:var(--mono);font-size:8px;letter-spacing:.15em;text-transform:uppercase;
+ border:1px solid var(--line);border-radius:20px;padding:3px 8px;color:var(--dim)}
+.pill.on{color:var(--a1);border-color:rgba(168,204,112,.28)}
+#sub{font-family:var(--mono);font-size:9px;letter-spacing:.14em;text-transform:uppercase;color:var(--dim)}
+#modes{position:fixed;top:13px;right:20px;z-index:11;display:flex;gap:4px}
+#modes button{font:600 10px var(--mono);letter-spacing:.1em;text-transform:uppercase;
+ background:rgba(238,242,234,.04);color:var(--mut);border:1px solid var(--line);
+ border-radius:20px;padding:6px 13px;cursor:pointer;transition:.15s}
+#modes button:hover{color:var(--ink)}
+#modes button.on{background:rgba(168,204,112,.16);color:var(--ink);border-color:rgba(168,204,112,.35)}
+#stats{position:fixed;left:20px;bottom:16px;z-index:11;display:flex;gap:22px;pointer-events:none;align-items:flex-end}
+#stats div{font-family:var(--mono)}
+#stats b{display:block;font-size:24px;font-weight:600;color:var(--a1);letter-spacing:-.03em;
+ line-height:1;font-variant-numeric:tabular-nums}
+#stats span{font-size:8px;letter-spacing:.13em;text-transform:uppercase;color:var(--dim)}
+#tip{position:fixed;z-index:12;background:rgba(9,11,9,.96);border:1px solid var(--line);
+ border-radius:8px;padding:7px 11px;font-size:11.5px;pointer-events:none;opacity:0;transition:opacity .1s;max-width:240px}
+#tip b{color:var(--a1)}
+#hint{position:fixed;right:20px;bottom:16px;z-index:11;font-family:var(--mono);font-size:8px;
+ line-height:2;letter-spacing:.11em;text-transform:uppercase;color:var(--dim);text-align:right;pointer-events:none}
+#load{position:fixed;inset:0;display:grid;place-items:center;z-index:20;background:var(--bg);
+ font-family:var(--mono);font-size:10px;letter-spacing:.2em;text-transform:uppercase;color:var(--dim)}
+#err{position:fixed;left:20px;top:60px;z-index:21;color:#e08b6b;font:11px var(--mono);
+ max-width:70ch;white-space:pre-wrap}
+</style></head><body>
+<canvas id="c"></canvas>
+<div id="top"><h1>groundtruth</h1><span class="pill on">verified in person</span>
+<span class="pill" id="build">gt-r6.1</span><span id="sub">loading</span></div>
+<div id="modes"><button data-m="co">Colorado</button><button data-m="us" class="on">USA</button><button data-m="globe">Globe</button></div>
+<div id="stats"></div><div id="tip"></div><div id="hint"></div><div id="err"></div>
+<div id="load">ground-truthing</div>
+
+<script type="importmap">
+{"imports":{"three":"https://unpkg.com/three@0.160.0/build/three.module.js",
+"three/addons/":"https://unpkg.com/three@0.160.0/examples/jsm/"}}
+</script>
+<script type="module">
+import * as THREE from "three";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { PARKS } from "./parks.js?v=6";
+import { elev } from "./terrain.js?v=6";
+import { decodeTopo, albers, lonLatToSphere, bboxOf, inside } from "./geo.js?v=6";
+import { S, C } from "./style.js?v=6";
+
+const errEl = document.getElementById("err");
+const fail = m => { errEl.textContent = String(m); console.error(m); };
+addEventListener("error", e => fail("ERROR " + e.message));
+addEventListener("unhandledrejection", e => fail("PROMISE " + (e.reason?.message || e.reason)));
+
+const cv = document.getElementById("c");
+const renderer = new THREE.WebGLRenderer({ canvas: cv, antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+const scene = new THREE.Scene(); scene.background = new THREE.Color(C.bg);
+const camera = new THREE.PerspectiveCamera(40, 1, .1, 6000);
+const controls = new OrbitControls(camera, cv);
+controls.enableDamping = true; controls.dampingFactor = .075;
+scene.add(new THREE.AmbientLight(0xffffff, .78));
+const sun = new THREE.DirectionalLight(0xfff6e8, 1.35); sun.position.set(-70, 110, 55); scene.add(sun);
+scene.add(new THREE.HemisphereLight(0x8fb6d6, 0x151a13, .5));
+
+let DATA, STATES, WORLD, mode = "us";
+const group = new THREE.Group(); scene.add(group);
+let markers = [], labels = [], pulses = [];
+function clear() {
+  markers = []; labels = []; pulses = []; group.rotation.y = 0;
+  while (group.children.length) { const o = group.children.pop();
+    o.geometry?.dispose(); if (o.material?.map) o.material.map.dispose(); o.material?.dispose?.(); }
+}
+const resize = () => { renderer.setSize(innerWidth, innerHeight);
+  camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); };
+addEventListener("resize", resize);
+
+/* ── labels: small, distance-scaled, collision-culled ─────────────────── */
+const LC = new Map();
+function label(text, colour, big) {
+  const k = text + colour;
+  if (!LC.has(k)) {
+    const f = 30, pad = 7, mm = document.createElement("canvas").getContext("2d");
+    mm.font = `600 ${f}px ui-monospace, monospace`;
+    const c = document.createElement("canvas");
+    c.width = Math.ceil(mm.measureText(text).width) + pad * 2; c.height = f + pad * 2;
+    const x = c.getContext("2d"); x.font = `600 ${f}px ui-monospace, monospace`;
+    x.fillStyle = colour; x.textBaseline = "middle"; x.fillText(text, pad, c.height / 2);
+    const t = new THREE.CanvasTexture(c); t.minFilter = THREE.LinearFilter; t.anisotropy = 4;
+    LC.set(k, { t, ar: c.width / c.height });
+  }
+  const { t, ar } = LC.get(k);
+  const h = big ? S.LABEL_BIG : S.LABEL;
+  const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: t, transparent: true, depthWrite: false }));
+  sp.scale.set(ar * h, h, 1);
+  sp.userData = { ar, h, px: text.length * 6.6, big: !!big };
+  labels.push(sp); return sp;
+}
+const _v = new THREE.Vector3();
+function cullLabels() {
+  const shown = [];
+  const sorted = labels.slice().sort((a, b) =>
+    camera.position.distanceTo(a.position) - camera.position.distanceTo(b.position));
+  for (const l of sorted) {
+    _v.copy(l.position).project(camera);
+    const d = camera.position.distanceTo(l.position);
+    let hide = _v.z > 1 || d > 260;
+    const sx = (_v.x * .5 + .5) * innerWidth, sy = (-_v.y * .5 + .5) * innerHeight;
+    if (!hide && (sx < -60 || sx > innerWidth + 60 || sy < -30 || sy > innerHeight + 30)) hide = true;
+    const w = l.userData.px * (700 / d) * .05;
+    if (!hide) for (const s2 of shown)
+      if (Math.abs(sx - s2.x) < (w + s2.w) * .55 && Math.abs(sy - s2.y) < 15) { hide = true; break; }
+    l.visible = !hide;
+    if (!hide) {
+      shown.push({ x: sx, y: sy, w });
+      const k = Math.max(.7, Math.min(2.6, d / 46));
+      l.scale.set(l.userData.ar * l.userData.h * k, l.userData.h * k, 1);
+      l.material.opacity = Math.min(1, Math.max(.3, 150 / d));
+    }
+  }
+}
+
+/* ── markers: a small sphere, a hairline stem, a thin ground ring ──────── */
+const SPH = new THREE.SphereGeometry(1, 16, 16);
+const RING = new THREE.RingGeometry(.72, 1, 32);
+function marker(colour, on, y) {
+  const g = new THREE.Group();
+  const r = on ? S.DOT_ON : S.DOT, h = on ? S.STEM_ON : S.STEM;
+  const stem = new THREE.Mesh(new THREE.CylinderGeometry(r * .13, r * .13, h, 5),
+    new THREE.MeshBasicMaterial({ color: colour, transparent: true, opacity: .42 }));
+  stem.position.y = h / 2; g.add(stem);
+  const dot = new THREE.Mesh(SPH, new THREE.MeshBasicMaterial({ color: colour }));
+  dot.scale.setScalar(r); dot.position.y = h; g.add(dot);
+  const ring = new THREE.Mesh(RING, new THREE.MeshBasicMaterial({ color: colour,
+    transparent: true, opacity: on ? .34 : .16, side: THREE.DoubleSide, depthWrite: false }));
+  ring.rotation.x = -Math.PI / 2; ring.scale.setScalar(on ? S.RING : S.RING * .7);
+  ring.position.y = .04; g.add(ring);
+  g.position.y = y || 0;
+  if (on) { g.userData.ring = ring; pulses.push(g); }
+  return { g, hit: dot, top: h };
+}
+function tube(pts, colour, r, op) {
+  return new THREE.Mesh(
+    new THREE.TubeGeometry(new THREE.CatmullRomCurve3(pts), Math.max(40, pts.length * 8), r, 6, false),
+    new THREE.MeshBasicMaterial({ color: colour, transparent: true, opacity: op ?? .7 }));
+}
+
+/* ── polygon land ─────────────────────────────────────────────────────── */
+function land(feats, box, isOn, onCol, offCol, lift) {
+  const [x0, y0, x1, y1] = box, k = S.MAP / Math.max(x1 - x0, y1 - y0);
+  const flat = (lon, lat) => { const [x, y] = albers(lon, lat);
+    return [(x - (x0 + x1) / 2) * k, -(y - (y0 + y1) / 2) * k]; };
+  const world = (lon, lat) => { const [X, Y] = flat(lon, lat); return [X, -Y]; };
+  for (const f of feats) {
+    const on = isOn(f), d = on ? lift * 1.8 : lift;
+    for (const ring of f.rings) {
+      const sh = new THREE.Shape();
+      ring.forEach(([lo, la], i) => { const [X, Y] = flat(lo, la); i ? sh.lineTo(X, Y) : sh.moveTo(X, Y); });
+      const m = new THREE.Mesh(new THREE.ExtrudeGeometry(sh, { depth: d, bevelEnabled: false }),
+        new THREE.MeshStandardMaterial({ color: on ? onCol : offCol, roughness: .9, metalness: .03 }));
+      m.rotation.x = -Math.PI / 2; m.userData = { label: f.name, sub: on ? "been" : "not yet" };
+      group.add(m); markers.push(m);
+      const e = new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.ShapeGeometry(sh)),
+        new THREE.LineBasicMaterial({ color: on ? C.edgeOn : C.edgeOff, transparent: true, opacity: on ? .7 : .4 }));
+      e.rotation.x = -Math.PI / 2; e.position.y = d + .015; group.add(e);
+    }
+  }
+  return { world, k, box };
+}
+
+/* ── USA ──────────────────────────────────────────────────────────────── */
+function buildUS() {
+  clear();
+  const been = new Set(DATA.statesVisited), vis = new Set(DATA.parksVisited);
+  const sug = new Map((DATA.suggestions || []).map(x => [x.park, x.why]));
+  const conus = STATES.filter(f => !["Alaska", "Hawaii", "Puerto Rico"].includes(f.name));
+  const { world } = land(conus, bboxOf(conus), f => been.has(ABBR[f.name]), C.landOn, C.landOff, .28);
+  for (const rv of RIVERS) group.add(tube(rv.map(([la, lo]) => {
+    const [X, Z] = world(lo, la); return new THREE.Vector3(X, .62, Z); }), C.river, S.RIVER, .55));
+  for (const rt of (DATA.routes || [])) {
+    const p = rt.pts.filter(q => q[0] < 50 && q[0] > 24 && q[1] > -126 && q[1] < -66)
+      .map(([la, lo]) => { const [X, Z] = world(lo, la); return new THREE.Vector3(X, .70, Z); });
+    if (p.length > 1) group.add(tube(p, rt.mode === "rail" ? C.town : C.road, S.ROAD, .75));
+  }
+  for (const p of PARKS) {
+    if (p.lat > 50 || p.lat < 24 || p.lon < -126 || p.lon > -66) continue;
+    const on = vis.has(p.name), s = !on && sug.has(p.name);
+    const [X, Z] = world(p.lon, p.lat);
+    const { g, hit, top } = marker(on ? C.park : s ? C.next : 0x6b7568, on || s, .58);
+    g.position.set(X, .58, Z);
+    hit.userData = { label: p.name, sub: s ? sug.get(p.name) : p.state + (on ? " · visited" : "") };
+    group.add(g); markers.push(hit);
+    if (on || s) { const l = label(p.name, on ? "#c8e29a" : "#eddaa0", on);
+      l.position.set(X, .58 + top + .7, Z); group.add(l); }
+  }
+  ease(new THREE.Vector3(0, 62, 74), new THREE.Vector3(0, 0, 3));
+  const sc = PARKS.filter(p => !vis.has(p.name) && sug.has(p.name)).length;
+  stats([[DATA.parksVisited.length, "of 63 parks"],
+    [Math.round(DATA.parksVisited.length / 63 * 100) + "%", "coverage"],
+    [DATA.statesVisited.length, "of 51 states"], [sc, "suggested"]]);
+  legend(["#a8cc70 visited", "#e3c765 suggested", "#d9963f drives", "#4f93b5 rivers"]);
+}
+
+/* ── COLORADO: real border, real relief clipped inside it ─────────────── */
+function buildCO() {
+  clear();
+  const co = STATES.find(f => f.name === "Colorado");
+  if (!co) return fail("Colorado not found in the state topology");
+  const box = bboxOf([co]), k = S.MAP / Math.max(box[2] - box[0], box[3] - box[1]);
+  const world = (lon, lat) => { const [x, y] = albers(lon, lat);
+    return [(x - (box[0] + box[2]) / 2) * k, (y - (box[1] + box[3]) / 2) * k * -1 * -1]; };
+  const W2 = (lon, lat) => { const [x, y] = albers(lon, lat);
+    return [(x - (box[0] + box[2]) / 2) * k, -(y - (box[1] + box[3]) / 2) * k]; };
+  const B = [36.98, 41.01, -109.06, -102.04];
+  const eMin = 3300, eMax = 14440;
+  const hAt = (lo, la) => (elev(la, lo, "co") - eMin) / (eMax - eMin) * S.RELIEF_CO;
+  // grid, keeping only triangles whose centre falls inside the real border
+  const NX = 300, NY = 190, pos = [], col = [], idx = [];
+  const gi = (i, j) => j * (NX + 1) + i;
+  for (let j = 0; j <= NY; j++) for (let i = 0; i <= NX; i++) {
+    const lo = B[2] + (B[3] - B[2]) * i / NX, la = B[1] - (B[1] - B[0]) * j / NY;
+    const [X, Z] = W2(lo, la), e = elev(la, lo, "co");
+    pos.push(X, (e - eMin) / (eMax - eMin) * S.RELIEF_CO, Z);
+    const t = Math.min(1, Math.max(0, (e - 3400) / 10800));
+    const c = t < .26 ? [.19 + t * .42, .28 + t * .50, .18 + t * .30]
+            : t < .52 ? [.35 + t * .26, .39 + t * .21, .26 + t * .12]
+            : t < .76 ? [.47 + t * .13, .46 + t * .12, .43 + t * .11]
+                      : [.82 + t * .15, .85 + t * .13, .88 + t * .11];
+    col.push(...c);
+  }
+  for (let j = 0; j < NY; j++) for (let i = 0; i < NX; i++) {
+    const lo = B[2] + (B[3] - B[2]) * (i + .5) / NX, la = B[1] - (B[1] - B[0]) * (j + .5) / NY;
+    if (!inside(lo, la, co.rings)) continue;
+    idx.push(gi(i, j), gi(i + 1, j + 1), gi(i + 1, j), gi(i, j), gi(i, j + 1), gi(i + 1, j + 1));
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute("color", new THREE.Float32BufferAttribute(col, 3));
+  g.setIndex(idx); g.computeVertexNormals();
+  group.add(new THREE.Mesh(g, new THREE.MeshStandardMaterial({
+    vertexColors: true, roughness: .93, metalness: .02, side: THREE.DoubleSide })));
+  for (const ring of co.rings) group.add(new THREE.Line(
+    new THREE.BufferGeometry().setFromPoints(ring.map(([lo, la]) => {
+      const [X, Z] = W2(lo, la); return new THREE.Vector3(X, hAt(lo, la) + .12, Z); })),
+    new THREE.LineBasicMaterial({ color: C.edgeOn, transparent: true, opacity: .55 })));
+  for (const rv of CO_RIVERS) group.add(tube(rv.map(([la, lo]) => {
+    const [X, Z] = W2(lo, la); return new THREE.Vector3(X, hAt(lo, la) + .10, Z); }),
+    C.river, S.RIVER * .8, .6));
+  for (const rt of (DATA.routes || [])) {
+    const p = rt.pts.filter(q => q[0] > B[0] && q[0] < B[1] && q[1] > B[2] && q[1] < B[3])
+      .map(([la, lo]) => { const [X, Z] = W2(lo, la); return new THREE.Vector3(X, hAt(lo, la) + .14, Z); });
+    if (p.length > 1) group.add(tube(p, C.road, S.ROAD * .8, .7));
+  }
+  const vis = new Set(DATA.parksVisited);
+  for (const p of PARKS.filter(p => p.state === "CO")) {
+    const on = vis.has(p.name), [X, Z] = W2(p.lon, p.lat), y = hAt(p.lon, p.lat);
+    const { g: mg, hit, top } = marker(on ? C.park : C.next, true, y);
+    mg.position.set(X, y, Z);
+    hit.userData = { label: p.name, sub: on ? "visited" : "the last one in Colorado" };
+    group.add(mg); markers.push(hit);
+    const l = label(p.name, on ? "#c8e29a" : "#eddaa0", true);
+    l.position.set(X, y + top + .8, Z); group.add(l);
+  }
+  for (const t of (DATA.coTowns || [])) {
+    const [X, Z] = W2(t.lon, t.lat), y = hAt(t.lon, t.lat);
+    const d = new THREE.Mesh(SPH, new THREE.MeshBasicMaterial({ color: t.been ? C.town : 0x4d5648,
+      transparent: !t.been, opacity: t.been ? 1 : .5 }));
+    d.scale.setScalar(t.been ? .17 : .10); d.position.set(X, y + .12, Z);
+    d.userData = { label: t.name, sub: t.been ? "been" : "not yet" };
+    group.add(d); markers.push(d);
+    if (t.been && BIG.has(t.name)) { const l = label(t.name, "rgba(150,180,205,.9)");
+      l.position.set(X, y + .75, Z); group.add(l); }
+  }
+  for (const f of (DATA.fourteeners || [])) {
+    const [X, Z] = W2(f.lon, f.lat), y = hAt(f.lon, f.lat);
+    const up = f.summited, pl = f.planned;
+    const h = S.PEAK * (.55 + (f.ft - 14000) / 440 * .8);
+    const colr = up ? C.summit : pl ? C.next : 0x7d8a77;
+    const sh = new THREE.Mesh(new THREE.CylinderGeometry(up ? .075 : pl ? .065 : .035, .012, h, 5),
+      new THREE.MeshBasicMaterial({ color: colr, transparent: true, opacity: up ? .95 : pl ? .85 : .38 }));
+    sh.position.set(X, y + h / 2, Z);
+    sh.userData = { label: f.name, sub: f.ft.toLocaleString() + " ft"
+      + (f.cls ? ` · class ${f.cls} · ${f.mi} mi · ${f.gain.toLocaleString()} ft gain` : "")
+      + (up ? " · SUMMITED" : pl ? " · PLANNED" : "") };
+    group.add(sh); markers.push(sh);
+    if (up || pl) {
+      const cap = new THREE.Mesh(SPH, new THREE.MeshBasicMaterial({ color: colr }));
+      cap.scale.setScalar(up ? .15 : .12); cap.position.set(X, y + h, Z); group.add(cap);
+      const l = label(f.name.replace(/^Mt\. /, ""), up ? "#f2f6ee" : "#eddaa0", up);
+      l.position.set(X, y + h + .6, Z); group.add(l);
+    }
+  }
+  ease(new THREE.Vector3(0, 40, 58), new THREE.Vector3(0, 2, 0));
+  const tb = (DATA.coTowns || []).filter(t => t.been).length;
+  const ft = (DATA.fourteeners || []).filter(f => f.summited).length;
+  stats([[PARKS.filter(p => p.state === "CO" && vis.has(p.name)).length, "of 4 CO parks"],
+    [tb, "of " + (DATA.coTowns || []).length + " towns"], [ft, "of 58 fourteeners"],
+    [Math.round(tb / Math.max(1, (DATA.coTowns || []).length) * 100) + "%", "town coverage"]]);
+  legend(["#f2f6ee summited", "#e3c765 next", "#86a8c4 towns", "#4f93b5 rivers"]);
+}
+
+/* ── GLOBE ────────────────────────────────────────────────────────────── */
+function buildGlobe() {
+  clear();
+  const R = 34, been = new Set(DATA.countriesVisited);
+  group.add(new THREE.Mesh(new THREE.SphereGeometry(R, 128, 128),
+    new THREE.MeshStandardMaterial({ color: 0x0c1a22, roughness: .96, metalness: .04 })));
+  const N = 1400, sp = new Float32Array(N * 3);
+  for (let i = 0; i < N; i++) { const r = 500 + Math.random() * 900,
+    t = Math.random() * 6.283, p = Math.acos(2 * Math.random() - 1);
+    sp[i*3] = r*Math.sin(p)*Math.cos(t); sp[i*3+1] = r*Math.cos(p); sp[i*3+2] = r*Math.sin(p)*Math.sin(t); }
+  const sg = new THREE.BufferGeometry(); sg.setAttribute("position", new THREE.BufferAttribute(sp, 3));
+  group.add(new THREE.Points(sg, new THREE.PointsMaterial({ color: 0xeef2ea, size: 1.2,
+    sizeAttenuation: false, transparent: true, opacity: .4 })));
+  for (const f of WORLD) {
+    const on = been.has(f.name);
+    for (const ring of f.rings) {
+      const pts = ring.map(([lo, la]) => new THREE.Vector3(...lonLatToSphere(lo, la, R * 1.003)));
+      group.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts),
+        new THREE.LineBasicMaterial({ color: on ? 0xcaeb96 : 0x3f4c41, transparent: true, opacity: on ? 1 : .5 })));
+      if (on) for (const [rr, oo] of [[1.008, .34], [1.016, .18]])
+        group.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(
+          ring.map(([lo, la]) => new THREE.Vector3(...lonLatToSphere(lo, la, R * rr)))),
+          new THREE.LineBasicMaterial({ color: C.park, transparent: true, opacity: oo,
+            blending: THREE.AdditiveBlending, depthWrite: false })));
+    }
+    if (on) { let cx = 0, cy = 0, n = 0;
+      for (const r of f.rings) for (const [lo, la] of r) { cx += lo; cy += la; n++; }
+      const l = label(f.name, "#caeb96", true);
+      l.position.set(...lonLatToSphere(cx / n, cy / n, R * 1.06)); group.add(l); }
+  }
+  for (const c of DATA.cities) {
+    const m = new THREE.Mesh(SPH, new THREE.MeshBasicMaterial({ color: C.park }));
+    m.scale.setScalar(.24); m.position.set(...lonLatToSphere(c.lon, c.lat, R * 1.008));
+    m.userData = { label: c.name, sub: "city" }; group.add(m); markers.push(m);
+  }
+  ease(new THREE.Vector3(42, 28, 62), new THREE.Vector3(0, 0, 0));
+  stats([[DATA.countriesVisited.length, "countries"], [DATA.cities.length, "cities"],
+    ["4/7", "continents"], [Math.round(DATA.countriesVisited.length / 195 * 100) + "%", "of the world"]]);
+  legend(["#caeb96 visited", "3 continents left"]);
+}
+
+const stats = r => document.getElementById("stats").innerHTML =
+  r.map(x => `<div><b>${x[0]}</b><span>${x[1]}</span></div>`).join("");
+const legend = r => document.getElementById("hint").innerHTML =
+  "drag orbit · scroll zoom · hover a marker<br>" + r.map(s => { const [c, ...t] = s.split(" ");
+    return c.startsWith("#") ? `<span style="color:${c}">${t.join(" ")}</span>` : s; }).join(" &nbsp; ");
+
+let tw = null;
+function ease(pos, tgt) {
+  const p0 = camera.position.clone(), t0 = controls.target.clone(), st = { v: 0 };
+  if (tw) cancelAnimationFrame(tw);
+  (function step() { st.v = Math.min(1, st.v + .045); const e = 1 - (1 - st.v) ** 3;
+    camera.position.lerpVectors(p0, pos, e); controls.target.lerpVectors(t0, tgt, e);
+    if (st.v < 1) tw = requestAnimationFrame(step); })();
+}
+const ray = new THREE.Raycaster(), mv = new THREE.Vector2(), tip = document.getElementById("tip");
+addEventListener("pointermove", e => {
+  mv.set((e.clientX / innerWidth) * 2 - 1, -(e.clientY / innerHeight) * 2 + 1);
+  ray.setFromCamera(mv, camera);
+  const h = ray.intersectObjects(markers, false).find(o => o.object.userData?.label);
+  if (h) { tip.innerHTML = `<b>${h.object.userData.label}</b><br>${h.object.userData.sub}`;
+    tip.style.left = (e.clientX + 13) + "px"; tip.style.top = (e.clientY + 11) + "px";
+    tip.style.opacity = 1; cv.style.cursor = "pointer";
+  } else { tip.style.opacity = 0; cv.style.cursor = "grab"; }
+});
+function go(m) {
+  mode = m; errEl.textContent = "";
+  document.querySelectorAll("#modes button").forEach(b => b.classList.toggle("on", b.dataset.m === m));
+  document.getElementById("sub").textContent =
+    m === "co" ? "colorado · 58 fourteeners" : m === "us" ? "united states · 63 parks" : "the world";
+  try { m === "co" ? buildCO() : m === "us" ? buildUS() : buildGlobe(); } catch (e) { fail(e.stack || e); }
+}
+document.querySelectorAll("#modes button").forEach(b => b.addEventListener("click", () => go(b.dataset.m)));
+let held = false;
+cv.addEventListener("pointerdown", () => held = true);
+addEventListener("pointerup", () => setTimeout(() => held = false, 2200));
+const t0 = performance.now();
+(function loop(){
+  requestAnimationFrame(loop);
+  const t = (performance.now() - t0) / 1000;
+  if (mode === "globe" && !held) group.rotation.y += .00028;
+  for (const g of pulses) { const r = g.userData.ring; if (!r) continue;
+    r.material.opacity = .22 + .14 * (1 + Math.sin(t * 1.5 + g.position.x * .25)) * .5; }
+  cullLabels(); controls.update(); renderer.render(scene, camera);
+})();
+
+const BIG = new Set(["Denver","Boulder","Fort Collins","Colorado Springs","Pueblo","Grand Junction",
+ "Durango","Aspen","Vail","Breckenridge","Leadville","Salida","Buena Vista","Glenwood Springs",
+ "Steamboat Springs","Estes Park","Silverton","Telluride","Alamosa","Highlands Ranch","Golden",
+ "Winter Park","Frisco","Palisade","Georgetown","Fairplay"]);
+const CO_RIVERS = [
+ [[40.45,-105.9],[40.20,-106.35],[39.90,-106.42],[39.60,-106.85],[39.50,-107.32],[39.20,-108.05],[39.06,-108.55],[39.02,-109.03]],
+ [[39.15,-106.30],[38.90,-106.10],[38.70,-105.90],[38.45,-105.20],[38.26,-104.61],[38.10,-103.60],[38.05,-102.10]],
+ [[37.85,-106.35],[37.60,-105.95],[37.35,-105.75],[37.05,-105.70]],
+ [[40.60,-105.55],[40.45,-105.00],[40.40,-104.30],[40.55,-103.60],[40.68,-102.10]],
+ [[37.70,-107.60],[37.40,-107.75],[37.15,-107.88],[36.99,-108.00]],
+ [[40.55,-106.85],[40.35,-107.30],[40.20,-107.80],[40.05,-108.40]]];
+const RIVERS = [
+ [[47.9,-95.0],[45.0,-93.2],[43.5,-91.2],[41.5,-90.6],[38.6,-90.2],[36.5,-89.5],[35.1,-90.1],[32.3,-90.9],[31.0,-91.4],[29.9,-90.1],[29.2,-89.3]],
+ [[43.0,-110.0],[41.5,-109.5],[40.0,-110.2],[38.4,-109.6],[37.9,-111.0],[36.9,-111.5],[36.1,-112.1],[36.0,-114.0],[34.7,-114.5],[32.7,-114.6]],
+ [[47.7,-115.5],[46.7,-117.0],[46.2,-119.0],[45.7,-120.7],[45.6,-121.9],[46.2,-123.9]],
+ [[47.5,-111.3],[46.5,-104.0],[44.4,-100.4],[42.9,-97.4],[40.7,-95.9],[39.1,-94.6],[38.6,-90.2]],
+ [[39.1,-106.3],[38.5,-105.2],[38.2,-104.6],[38.0,-102.2],[37.7,-99.0],[36.1,-95.9],[35.0,-91.2],[33.9,-91.1]],
+ [[44.5,-74.0],[43.3,-73.8],[42.7,-73.7],[41.5,-73.9],[40.7,-74.0]]];
+const ABBR = {Alabama:"AL",Alaska:"AK",Arizona:"AZ",Arkansas:"AR",California:"CA",Colorado:"CO",
+Connecticut:"CT",Delaware:"DE","District of Columbia":"DC",Florida:"FL",Georgia:"GA",Hawaii:"HI",
+Idaho:"ID",Illinois:"IL",Indiana:"IN",Iowa:"IA",Kansas:"KS",Kentucky:"KY",Louisiana:"LA",Maine:"ME",
+Maryland:"MD",Massachusetts:"MA",Michigan:"MI",Minnesota:"MN",Mississippi:"MS",Missouri:"MO",
+Montana:"MT",Nebraska:"NE",Nevada:"NV","New Hampshire":"NH","New Jersey":"NJ","New Mexico":"NM",
+"New York":"NY","North Carolina":"NC","North Dakota":"ND",Ohio:"OH",Oklahoma:"OK",Oregon:"OR",
+Pennsylvania:"PA","Rhode Island":"RI","South Carolina":"SC","South Dakota":"SD",Tennessee:"TN",
+Texas:"TX",Utah:"UT",Vermont:"VT",Virginia:"VA",Washington:"WA","West Virginia":"WV",
+Wisconsin:"WI",Wyoming:"WY"};
+
+(async function init(){
+  resize();
+  try {
+    const [d, us, w] = await Promise.all([
+      fetch("./travel.json?" + Date.now()).then(r => r.json()),
+      fetch("https://unpkg.com/us-atlas@3/states-10m.json").then(r => r.json()),
+      fetch("https://unpkg.com/world-atlas@2/countries-110m.json").then(r => r.json())]);
+    DATA = d; STATES = decodeTopo(us, "states"); WORLD = decodeTopo(w, "countries");
+    console.log("[groundtruth] states", STATES.length, "countries", WORLD.length);
+    go("us"); document.getElementById("load").remove();
+  } catch (e) { fail("data load failed — " + (e.message || e)); document.getElementById("load").remove(); }
+})();
+</script></body></html>
